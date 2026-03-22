@@ -15,12 +15,240 @@ warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 try:
+    import types
+    import mlx.core as mx
+    from tqdm import tqdm
     from mlx_audio.tts.utils import load_model
     from mlx_audio.tts.generate import generate_audio
+    from mlx_audio.tts.models.base import GenerationResult
 except ImportError:
     print("Error: 'mlx_audio' library not found.")
     print("Run: source .venv/bin/activate")
     sys.exit(1)
+
+
+def _format_duration(seconds):
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:06.3f}"
+
+
+def _optimized_generate_with_instruct(
+    self, text, speaker, language, instruct, temperature, max_tokens,
+    top_k, top_p, repetition_penalty, verbose, stream=False, streaming_interval=2.0,
+):
+    """Optimized generation with single GPU-CPU sync per token step."""
+    if self.speech_tokenizer is None:
+        raise ValueError("Speech tokenizer not loaded")
+
+    start_time = time.time()
+
+    input_embeds, trailing_text_hidden, tts_pad_embed = (
+        self._prepare_generation_inputs(
+            text=text, language=language, speaker=speaker, instruct=instruct,
+        )
+    )
+
+    target_token_count = len(self.tokenizer.encode(text))
+    effective_max_tokens = min(max_tokens, max(75, target_token_count * 6))
+
+    cache = self.talker.make_cache()
+    generated_codes = []
+    generated_token_history = []  # Incremental tracking instead of O(n^2) rebuild
+    config = self.config.talker_config
+    eos_token_id = config.codec_eos_token_id
+    suppress_tokens = [
+        i for i in range(config.vocab_size - 1024, config.vocab_size)
+        if i != eos_token_id
+    ]
+    trailing_idx = 0
+
+    streaming_chunk_size = max(1, int(streaming_interval * 12.5))
+    decoded_tokens = 0
+    context_size = 25
+
+    pbar = tqdm(
+        total=effective_max_tokens, desc="Generating", unit="tokens",
+        disable=not verbose, leave=False,
+    )
+
+    for step in range(effective_max_tokens):
+        # === All operations below are LAZY (no GPU-CPU sync) ===
+
+        # Talker forward pass
+        logits, hidden = self.talker(input_embeds, cache=cache)
+
+        # Sample first codebook token
+        next_token = self._sample_token(
+            logits, temperature=temperature, top_k=top_k, top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            generated_tokens=generated_token_history or None,
+            suppress_tokens=suppress_tokens, eos_token_id=eos_token_id,
+        )
+
+        # Code predictor for remaining 15 codebooks (all lazy)
+        code_tokens = [next_token]
+        code_hidden = hidden[:, -1:, :]
+        code_cache = self.talker.code_predictor.make_cache()
+
+        for code_idx in range(config.num_code_groups - 1):
+            if code_idx == 0:
+                code_0_embed = self.talker.get_input_embeddings()(next_token)
+                code_input = mx.concatenate([code_hidden, code_0_embed], axis=1)
+            else:
+                code_embed = self.talker.code_predictor.codec_embedding[
+                    code_idx - 1
+                ](code_tokens[-1])
+                code_input = code_embed
+
+            code_logits, code_cache, _ = self.talker.code_predictor(
+                code_input, cache=code_cache, generation_step=code_idx,
+            )
+
+            next_code = self._sample_token(
+                code_logits, temperature=temperature, top_k=top_k, top_p=top_p,
+            )
+            code_tokens.append(next_code)
+
+        all_codes = mx.concatenate(code_tokens, axis=1)
+
+        # Prepare next input embedding (lazy)
+        if trailing_idx < trailing_text_hidden.shape[1]:
+            text_embed = trailing_text_hidden[:, trailing_idx : trailing_idx + 1, :]
+            trailing_idx += 1
+        else:
+            text_embed = tts_pad_embed
+
+        codec_embed = self.talker.get_input_embeddings()(next_token)
+        for i, code in enumerate(code_tokens[1:]):
+            codec_embed = (
+                codec_embed + self.talker.code_predictor.codec_embedding[i](code)
+            )
+        input_embeds = text_embed + codec_embed
+
+        # === SINGLE GPU-CPU SYNC for the entire step ===
+        mx.eval(input_embeds, next_token, all_codes)
+
+        # EOS check (zero overhead - already evaluated)
+        token_val = int(next_token[0, 0])
+        if token_val == eos_token_id:
+            break
+
+        generated_token_history.append(token_val)
+        generated_codes.append(all_codes)
+        del code_cache
+
+        # Periodic memory cleanup only
+        if step > 0 and step % 100 == 0:
+            mx.clear_cache()
+
+        pbar.update(1)
+
+        # Streaming support
+        new_tokens = len(generated_codes) - decoded_tokens
+        if stream and new_tokens >= streaming_chunk_size:
+            start_idx = max(0, decoded_tokens - context_size)
+            codes_chunk = mx.stack(generated_codes[start_idx:], axis=1)
+            mx.eval(codes_chunk)
+
+            audio_chunk = self._decode_chunk(codes_chunk, chunk_tokens=streaming_chunk_size)
+
+            if decoded_tokens > 0 and start_idx < decoded_tokens:
+                context_tokens_count = decoded_tokens - start_idx
+                samples_per_token = self.speech_tokenizer.decode_upsample_rate
+                trim_samples = context_tokens_count * samples_per_token
+                if trim_samples < audio_chunk.shape[0]:
+                    audio_chunk = audio_chunk[trim_samples:]
+
+            decoded_tokens = len(generated_codes)
+
+            yield GenerationResult(
+                audio=audio_chunk, samples=audio_chunk.shape[0],
+                sample_rate=self.sample_rate, segment_idx=0,
+                token_count=new_tokens,
+                audio_duration=_format_duration(audio_chunk.shape[0] / self.sample_rate),
+                real_time_factor=0,
+                prompt={"tokens": new_tokens, "tokens-per-sec": 0},
+                audio_samples={"samples": audio_chunk.shape[0], "samples-per-sec": 0},
+                processing_time_seconds=0,
+                peak_memory_usage=mx.get_peak_memory() / 1e9,
+                is_streaming_chunk=True,
+            )
+            mx.clear_cache()
+
+    pbar.close()
+
+    # Streaming: yield remaining tokens
+    if stream and len(generated_codes) > decoded_tokens:
+        start_idx = max(0, decoded_tokens - context_size)
+        codes_chunk = mx.stack(generated_codes[start_idx:], axis=1)
+        mx.eval(codes_chunk)
+        audio_chunk = self._decode_chunk(codes_chunk, chunk_tokens=streaming_chunk_size)
+        if decoded_tokens > 0 and start_idx < decoded_tokens:
+            context_tokens_count = decoded_tokens - start_idx
+            samples_per_token = self.speech_tokenizer.decode_upsample_rate
+            trim_samples = context_tokens_count * samples_per_token
+            if trim_samples < audio_chunk.shape[0]:
+                audio_chunk = audio_chunk[trim_samples:]
+        new_tokens = len(generated_codes) - decoded_tokens
+        yield GenerationResult(
+            audio=audio_chunk, samples=audio_chunk.shape[0],
+            sample_rate=self.sample_rate, segment_idx=0, token_count=new_tokens,
+            audio_duration=_format_duration(audio_chunk.shape[0] / self.sample_rate),
+            real_time_factor=0,
+            prompt={"tokens": new_tokens, "tokens-per-sec": 0},
+            audio_samples={"samples": audio_chunk.shape[0], "samples-per-sec": 0},
+            processing_time_seconds=0,
+            peak_memory_usage=mx.get_peak_memory() / 1e9,
+            is_streaming_chunk=True, is_final_chunk=True,
+        )
+        return
+
+    if not generated_codes:
+        return
+
+    # Non-streaming: decode all at once
+    codes = mx.stack(generated_codes, axis=1)
+    audio, audio_lengths = self.speech_tokenizer.decode(codes)
+    audio = audio[0]
+    valid_len = int(audio_lengths[0])
+    if valid_len > 0 and valid_len < audio.shape[0]:
+        audio = audio[:valid_len]
+    mx.eval(audio)
+
+    elapsed_time = time.time() - start_time
+    samples = audio.shape[0]
+    token_count = len(generated_codes)
+    duration_seconds = samples / self.sample_rate
+    rtf = duration_seconds / elapsed_time if elapsed_time > 0 else 0
+
+    yield GenerationResult(
+        audio=audio, samples=samples, sample_rate=self.sample_rate,
+        segment_idx=0, token_count=token_count,
+        audio_duration=_format_duration(duration_seconds),
+        real_time_factor=rtf,
+        prompt={
+            "tokens": token_count,
+            "tokens-per-sec": token_count / elapsed_time if elapsed_time > 0 else 0,
+        },
+        audio_samples={
+            "samples": samples,
+            "samples-per-sec": samples / elapsed_time if elapsed_time > 0 else 0,
+        },
+        processing_time_seconds=elapsed_time,
+        peak_memory_usage=mx.get_peak_memory() / 1e9,
+    )
+    mx.clear_cache()
+
+
+def optimize_model(model):
+    """Patch generation loop to use single GPU-CPU sync per token step."""
+    if hasattr(model, '_generate_with_instruct'):
+        model._generate_with_instruct = types.MethodType(
+            _optimized_generate_with_instruct, model
+        )
+    return model
 
 # Configuration
 BASE_OUTPUT_DIR = os.path.join(os.getcwd(), "outputs")
@@ -232,6 +460,7 @@ def run_custom_session(model_key):
     print(f"\nLoading {info['name']}...")
     try:
         model = load_model(model_path)
+        model = optimize_model(model)
     except Exception as e:
         print(f"Load failed: {e}")
         return
@@ -289,6 +518,7 @@ def run_design_session(model_key):
     print(f"\nLoading {info['name']}...")
     try:
         model = load_model(model_path)
+        model = optimize_model(model)
     except Exception as e:
         print(f"Load failed: {e}")
         return
@@ -335,6 +565,7 @@ def run_clone_manager(model_key):
     print("\nLoading Base Model...")
     try:
         model = load_model(model_path)
+        model = optimize_model(model)
     except Exception as e:
         print(f"Load failed: {e}")
         return
