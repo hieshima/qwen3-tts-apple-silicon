@@ -73,11 +73,19 @@ def _optimized_generate_with_instruct(
         disable=not verbose, leave=False,
     )
 
+    profiling = os.environ.get("TTS_PROFILE") == "1"
+    profile_steps = 10  # Only print first N steps
+
     for step in range(effective_max_tokens):
-        # === All operations below are LAZY (no GPU-CPU sync) ===
+        if profiling:
+            step_t0 = time.perf_counter()
 
         # Talker forward pass
         logits, hidden = self.talker(input_embeds, cache=cache)
+
+        if profiling:
+            mx.eval(logits, hidden)
+            t_talker = time.perf_counter()
 
         # Sample first codebook token
         next_token = self._sample_token(
@@ -87,7 +95,11 @@ def _optimized_generate_with_instruct(
             suppress_tokens=suppress_tokens, eos_token_id=eos_token_id,
         )
 
-        # Code predictor for remaining 15 codebooks (all lazy)
+        if profiling:
+            mx.eval(next_token)
+            t_sample = time.perf_counter()
+
+        # Code predictor for remaining 15 codebooks
         code_tokens = [next_token]
         code_hidden = hidden[:, -1:, :]
         code_cache = self.talker.code_predictor.make_cache()
@@ -113,7 +125,11 @@ def _optimized_generate_with_instruct(
 
         all_codes = mx.concatenate(code_tokens, axis=1)
 
-        # Prepare next input embedding (lazy)
+        if profiling:
+            mx.eval(all_codes)
+            t_codepred = time.perf_counter()
+
+        # Prepare next input embedding
         if trailing_idx < trailing_text_hidden.shape[1]:
             text_embed = trailing_text_hidden[:, trailing_idx : trailing_idx + 1, :]
             trailing_idx += 1
@@ -127,8 +143,18 @@ def _optimized_generate_with_instruct(
             )
         input_embeds = text_embed + codec_embed
 
-        # === SINGLE GPU-CPU SYNC for the entire step ===
-        mx.eval(input_embeds, next_token, all_codes)
+        if profiling:
+            mx.eval(input_embeds)
+            t_embed = time.perf_counter()
+            if step < profile_steps or step % 100 == 0:
+                print(f"  Step {step}: talker={1000*(t_talker-step_t0):.1f}ms"
+                      f"  sample0={1000*(t_sample-t_talker):.1f}ms"
+                      f"  codepred={1000*(t_codepred-t_sample):.1f}ms"
+                      f"  embed={1000*(t_embed-t_codepred):.1f}ms"
+                      f"  total={1000*(t_embed-step_t0):.1f}ms")
+        else:
+            # === SINGLE GPU-CPU SYNC for the entire step ===
+            mx.eval(input_embeds, next_token, all_codes)
 
         # EOS check (zero overhead - already evaluated)
         token_val = int(next_token[0, 0])
@@ -242,12 +268,333 @@ def _optimized_generate_with_instruct(
     mx.clear_cache()
 
 
+def _optimized_generate_icl(
+    self, text, ref_audio, ref_text, language="auto", temperature=0.9,
+    max_tokens=4096, top_k=50, top_p=1.0, repetition_penalty=1.5, verbose=False,
+):
+    """Optimized ICL generation with single GPU-CPU sync per token step."""
+    if self.speech_tokenizer is None:
+        raise ValueError("Speech tokenizer not loaded")
+
+    start_time = time.time()
+
+    input_embeds, trailing_text_hidden, tts_pad_embed, ref_codes = (
+        self._prepare_icl_generation_inputs(
+            text=text, ref_audio=ref_audio, ref_text=ref_text, language=language,
+        )
+    )
+
+    target_token_count = len(self.tokenizer.encode(text))
+    effective_max_tokens = min(max_tokens, max(75, target_token_count * 6))
+
+    cache = self.talker.make_cache()
+    generated_codes = []
+    generated_token_history = []
+    config = self.config.talker_config
+    eos_token_id = config.codec_eos_token_id
+    suppress_tokens = [
+        i for i in range(config.vocab_size - 1024, config.vocab_size)
+        if i != eos_token_id
+    ]
+    trailing_idx = 0
+
+    pbar = tqdm(
+        total=effective_max_tokens, desc="ICL Generation", unit="tokens",
+        disable=not verbose, leave=False,
+    )
+
+    for step in range(effective_max_tokens):
+        logits, hidden = self.talker(input_embeds, cache=cache)
+
+        next_token = self._sample_token(
+            logits, temperature=temperature, top_k=top_k, top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            generated_tokens=generated_token_history or None,
+            suppress_tokens=suppress_tokens, eos_token_id=eos_token_id,
+        )
+
+        code_tokens = [next_token]
+        code_hidden = hidden[:, -1:, :]
+        code_cache = self.talker.code_predictor.make_cache()
+
+        for code_idx in range(config.num_code_groups - 1):
+            if code_idx == 0:
+                code_0_embed = self.talker.get_input_embeddings()(next_token)
+                code_input = mx.concatenate([code_hidden, code_0_embed], axis=1)
+            else:
+                code_embed = self.talker.code_predictor.codec_embedding[
+                    code_idx - 1
+                ](code_tokens[-1])
+                code_input = code_embed
+
+            code_logits, code_cache, _ = self.talker.code_predictor(
+                code_input, cache=code_cache, generation_step=code_idx,
+            )
+
+            next_code = self._sample_token(
+                code_logits, temperature=temperature, top_k=top_k, top_p=top_p,
+            )
+            code_tokens.append(next_code)
+
+        all_codes = mx.concatenate(code_tokens, axis=1)
+
+        if trailing_idx < trailing_text_hidden.shape[1]:
+            text_embed = trailing_text_hidden[:, trailing_idx : trailing_idx + 1, :]
+            trailing_idx += 1
+        else:
+            text_embed = tts_pad_embed
+
+        codec_embed = self.talker.get_input_embeddings()(next_token)
+        for i, code in enumerate(code_tokens[1:]):
+            codec_embed = (
+                codec_embed + self.talker.code_predictor.codec_embedding[i](code)
+            )
+        input_embeds = text_embed + codec_embed
+
+        # Single GPU-CPU sync
+        mx.eval(input_embeds, next_token, all_codes)
+
+        token_val = int(next_token[0, 0])
+        if token_val == eos_token_id:
+            break
+
+        generated_token_history.append(token_val)
+        generated_codes.append(all_codes)
+        del code_cache
+
+        if step > 0 and step % 100 == 0:
+            mx.clear_cache()
+
+        pbar.update(1)
+
+    pbar.close()
+
+    if not generated_codes:
+        return
+
+    # ICL decode: prepend ref_codes to generated codes
+    gen_codes = mx.stack(generated_codes, axis=1)
+    ref_codes_t = mx.transpose(ref_codes, (0, 2, 1))
+    full_codes = mx.concatenate([ref_codes_t, gen_codes], axis=1)
+
+    ref_len = ref_codes.shape[2]
+    total_len = full_codes.shape[1]
+
+    audio, audio_lengths = self.speech_tokenizer.decode(full_codes)
+    audio = audio[0]
+
+    valid_len = int(audio_lengths[0])
+    if valid_len > 0 and valid_len < audio.shape[0]:
+        audio = audio[:valid_len]
+
+    # Proportional trim to remove reference audio portion
+    cut = int(ref_len / max(total_len, 1) * audio.shape[0])
+    if cut > 0 and cut < audio.shape[0]:
+        audio = audio[cut:]
+
+    mx.eval(audio)
+
+    elapsed_time = time.time() - start_time
+    samples = audio.shape[0]
+    token_count = len(generated_codes)
+    duration_seconds = samples / self.sample_rate
+    rtf = duration_seconds / elapsed_time if elapsed_time > 0 else 0
+
+    yield GenerationResult(
+        audio=audio, samples=samples, sample_rate=self.sample_rate,
+        segment_idx=0, token_count=token_count,
+        audio_duration=_format_duration(duration_seconds),
+        real_time_factor=rtf,
+        prompt={
+            "tokens": token_count,
+            "tokens-per-sec": token_count / elapsed_time if elapsed_time > 0 else 0,
+        },
+        audio_samples={
+            "samples": samples,
+            "samples-per-sec": samples / elapsed_time if elapsed_time > 0 else 0,
+        },
+        processing_time_seconds=elapsed_time,
+        peak_memory_usage=mx.get_peak_memory() / 1e9,
+    )
+    mx.clear_cache()
+
+
+def _ablation_revert_rmsnorm():
+    """Revert RMSNorm to manual implementation (for A/B testing)."""
+    from mlx_audio.tts.models.qwen3_tts.talker import RMSNorm
+
+    def manual_rmsnorm(self, x):
+        x_float = x.astype(mx.float32)
+        variance = mx.mean(x_float**2, axis=-1, keepdims=True)
+        x_normed = x_float * mx.rsqrt(variance + self.eps)
+        return (self.weight * x_normed).astype(x.dtype)
+
+    RMSNorm.__call__ = manual_rmsnorm
+    print("[ABLATION] RMSNorm reverted to manual (unfused)")
+
+
+def _ablation_revert_rope(model):
+    """Revert code predictor RoPE to manual implementation (for A/B testing)."""
+    from mlx_audio.tts.models.qwen3_tts.talker import (
+        CodePredictorAttention, CodePredictorDecoderLayer, CodePredictorModel,
+        apply_rotary_pos_emb,
+    )
+
+    def attn_call_manual_rope(self, x, position_embeddings, mask=None, cache=None):
+        batch, seq_len, _ = x.shape
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+        q = q.reshape(batch, seq_len, self.num_heads, self.head_dim)
+        k = k.reshape(batch, seq_len, self.num_kv_heads, self.head_dim)
+        v = v.reshape(batch, seq_len, self.num_kv_heads, self.head_dim)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        q = mx.transpose(q, (0, 2, 1, 3))
+        k = mx.transpose(k, (0, 2, 1, 3))
+        v = mx.transpose(v, (0, 2, 1, 3))
+        cos, sin = position_embeddings
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        if cache is not None:
+            k, v = cache.update_and_fetch(k, v)
+        output = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=mask)
+        output = mx.transpose(output, (0, 2, 1, 3))
+        output = output.reshape(batch, seq_len, -1)
+        return self.o_proj(output)
+
+    def layer_call_manual_rope(self, x, position_embeddings, mask=None, cache=None):
+        residual = x
+        x = self.input_layernorm(x)
+        x = self.self_attn(x, position_embeddings, mask, cache)
+        x = residual + x
+        residual = x
+        x = self.post_attention_layernorm(x)
+        x = self.mlp(x)
+        x = residual + x
+        return x
+
+    import mlx.nn as nn_mlx
+    def model_call_manual_rope(self, inputs_embeds, position_ids=None, mask=None, cache=None):
+        batch, seq_len, _ = inputs_embeds.shape
+        offset = 0
+        if cache is not None and cache[0] is not None:
+            offset = cache[0].offset
+        if position_ids is None:
+            position_ids = mx.arange(offset, offset + seq_len)[None, :]
+            position_ids = mx.broadcast_to(position_ids, (batch, seq_len))
+        position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
+        if mask is None and seq_len > 1:
+            mask = nn_mlx.MultiHeadAttention.create_additive_causal_mask(seq_len)
+            mask = mask.astype(inputs_embeds.dtype)
+        x = inputs_embeds
+        for i, layer in enumerate(self.layers):
+            layer_cache = cache[i] if cache is not None else None
+            x = layer(x, position_embeddings, mask, layer_cache)
+        x = self.norm(x)
+        return x
+
+    CodePredictorAttention.__call__ = attn_call_manual_rope
+    CodePredictorDecoderLayer.__call__ = layer_call_manual_rope
+    CodePredictorModel.__call__ = model_call_manual_rope
+    print("[ABLATION] Code predictor RoPE reverted to manual (unfused)")
+
+
+def _apply_fused_rmsnorm():
+    """Replace manual RMSNorm with mx.fast.rms_norm (single fused Metal kernel)."""
+    from mlx_audio.tts.models.qwen3_tts.talker import RMSNorm
+    RMSNorm.__call__ = lambda self, x: mx.fast.rms_norm(x, self.weight, self.eps)
+
+
+def _apply_fused_rope():
+    """Replace Code Predictor's manual RoPE with mx.fast.rope."""
+    from mlx_audio.tts.models.qwen3_tts.talker import (
+        CodePredictorAttention, CodePredictorDecoderLayer, CodePredictorModel,
+    )
+    import mlx.nn as nn_mlx
+
+    def attn_call_fused_rope(self, x, offset=0, mask=None, cache=None):
+        batch, seq_len, _ = x.shape
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+        q = q.reshape(batch, seq_len, self.num_heads, self.head_dim)
+        k = k.reshape(batch, seq_len, self.num_kv_heads, self.head_dim)
+        v = v.reshape(batch, seq_len, self.num_kv_heads, self.head_dim)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        q = mx.transpose(q, (0, 2, 1, 3))
+        k = mx.transpose(k, (0, 2, 1, 3))
+        v = mx.transpose(v, (0, 2, 1, 3))
+        q = mx.fast.rope(q, self.head_dim, traditional=False, base=self.config.rope_theta, scale=1.0, offset=offset)
+        k = mx.fast.rope(k, self.head_dim, traditional=False, base=self.config.rope_theta, scale=1.0, offset=offset)
+        if cache is not None:
+            k, v = cache.update_and_fetch(k, v)
+        output = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=mask)
+        output = mx.transpose(output, (0, 2, 1, 3))
+        output = output.reshape(batch, seq_len, -1)
+        return self.o_proj(output)
+
+    def layer_call_fused_rope(self, x, offset=0, mask=None, cache=None):
+        residual = x
+        x = self.input_layernorm(x)
+        x = self.self_attn(x, offset, mask, cache)
+        x = residual + x
+        residual = x
+        x = self.post_attention_layernorm(x)
+        x = self.mlp(x)
+        x = residual + x
+        return x
+
+    def model_call_fused_rope(self, inputs_embeds, position_ids=None, mask=None, cache=None):
+        batch, seq_len, _ = inputs_embeds.shape
+        offset = 0
+        if cache is not None and cache[0] is not None:
+            offset = cache[0].offset
+        if mask is None and seq_len > 1:
+            mask = nn_mlx.MultiHeadAttention.create_additive_causal_mask(seq_len)
+            mask = mask.astype(inputs_embeds.dtype)
+        x = inputs_embeds
+        for i, layer in enumerate(self.layers):
+            layer_cache = cache[i] if cache is not None else None
+            x = layer(x, offset, mask, layer_cache)
+        x = self.norm(x)
+        return x
+
+    CodePredictorAttention.__call__ = attn_call_fused_rope
+    CodePredictorDecoderLayer.__call__ = layer_call_fused_rope
+    CodePredictorModel.__call__ = model_call_fused_rope
+
+
 def optimize_model(model):
-    """Patch generation loop to use single GPU-CPU sync per token step."""
+    """Apply all inference optimizations via monkey-patching (never modifies .venv)."""
+    # 1. Fuse RMSNorm: mx.fast.rms_norm replaces manual 5-kernel implementation
+    _apply_fused_rmsnorm()
+
+    # 2. Fuse Code Predictor RoPE: mx.fast.rope replaces manual RotaryEmbedding
+    _apply_fused_rope()
+
+    # 3. Single GPU-CPU sync per token step
     if hasattr(model, '_generate_with_instruct'):
         model._generate_with_instruct = types.MethodType(
             _optimized_generate_with_instruct, model
         )
+    if hasattr(model, '_generate_icl'):
+        model._generate_icl = types.MethodType(
+            _optimized_generate_icl, model
+        )
+
+    # A/B testing: ABLATION env var reverts specific optimizations
+    ablation = os.environ.get("ABLATION", "").lower()
+    if ablation == "rmsnorm":
+        _ablation_revert_rope(model)
+    elif ablation == "rope":
+        _ablation_revert_rmsnorm()
+    elif ablation == "baseline":
+        _ablation_revert_rmsnorm()
+        _ablation_revert_rope(model)
+    elif ablation:
+        print(f"[ABLATION] Unknown: '{ablation}'. Use: rmsnorm, rope, baseline.")
+
     return model
 
 # Configuration
@@ -262,14 +609,16 @@ FILENAME_MAX_LEN = 20
 
 # Model Definitions
 MODELS = {
-    # Pro (1.7B)
+    # Pro (1.7B, 8-bit)
     "1": {"name": "Custom Voice", "folder": "Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit", "mode": "custom", "output_subfolder": "CustomVoice"},
     "2": {"name": "Voice Design", "folder": "Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit", "mode": "design", "output_subfolder": "VoiceDesign"},
     "3": {"name": "Voice Cloning", "folder": "Qwen3-TTS-12Hz-1.7B-Base-8bit", "mode": "clone_manager", "output_subfolder": "Clones"},
-    # Lite (0.6B)
+    # Lite (0.6B, 8-bit)
     "4": {"name": "Custom Voice", "folder": "Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit", "mode": "custom", "output_subfolder": "CustomVoice"},
     "5": {"name": "Voice Design", "folder": "Qwen3-TTS-12Hz-0.6B-VoiceDesign-8bit", "mode": "design", "output_subfolder": "VoiceDesign"},
     "6": {"name": "Voice Cloning", "folder": "Qwen3-TTS-12Hz-0.6B-Base-8bit", "mode": "clone_manager", "output_subfolder": "Clones"},
+    # Pro (1.7B, 4-bit) — faster, slightly lower quality
+    "7": {"name": "Custom Voice (4-bit)", "folder": "Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit", "mode": "custom", "output_subfolder": "CustomVoice"},
 }
 
 SPEAKER_MAP = {
@@ -638,7 +987,11 @@ def main_menu():
     print("  4. Custom Voice")
     print("  5. Voice Design")
     print("  6. Voice Cloning")
-    
+
+    print("\n  Pro 4-bit (1.7B - Faster, Slightly Lower Quality)")
+    print("  ---------------------------")
+    print("  7. Custom Voice (4-bit)")
+
     print("\n  q. Exit")
 
     choice = input("\nSelect: ").strip().lower()
