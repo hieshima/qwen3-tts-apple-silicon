@@ -34,6 +34,110 @@ def _format_duration(seconds):
     return f"{hours:02d}:{minutes:02d}:{secs:06.3f}"
 
 
+def _get_grouped_codepred_scheme():
+    """Get grouped codebook prediction scheme from GROUPED_CODEPRED env var.
+
+    Returns list of groups, where each group is a list of code_idx values.
+    Groups with 1 element are serial; groups with >1 are parallel.
+    Returns None if disabled.
+
+    Schemes:
+      alpha: 3 serial + 4 groups of 3 (conservative, 5+4 forward passes)
+      beta:  3 serial + group of 4 + group of 8 (aggressive, 3+2 forward passes)
+    """
+    scheme = os.environ.get("GROUPED_CODEPRED", "alpha").lower()
+    if scheme == "off":
+        return None
+    if scheme == "alpha":
+        # 3 serial + 4 parallel groups of 3
+        return [[0], [1], [2], [3, 4, 5], [6, 7, 8], [9, 10, 11], [12, 13, 14]]
+    elif scheme == "beta":
+        # 3 serial + group of 4 + group of 8
+        return [[0], [1], [2], [3, 4, 5, 6], [7, 8, 9, 10, 11, 12, 13, 14]]
+    else:
+        print(f"[GROUPED] Unknown scheme '{scheme}'. Use: alpha, beta.")
+        return None
+
+
+def _run_codepred_grouped(self, groups, next_token, hidden, config, temperature, top_k, top_p):
+    """Run code predictor with grouped parallel prediction.
+
+    For serial groups (size 1): standard sequential forward.
+    For parallel groups (size >1): single transformer forward, multiple lm_heads.
+    """
+    code_tokens = [next_token]
+    code_hidden = hidden[:, -1:, :]
+    code_cache = self.talker.code_predictor.make_cache()
+    cp = self.talker.code_predictor
+
+    for group in groups:
+        if len(group) == 1:
+            # Serial: standard code predictor forward
+            code_idx = group[0]
+            if code_idx == 0:
+                code_0_embed = self.talker.get_input_embeddings()(next_token)
+                code_input = mx.concatenate([code_hidden, code_0_embed], axis=1)
+            else:
+                code_embed = cp.codec_embedding[code_idx - 1](code_tokens[-1])
+                code_input = code_embed
+            code_logits, code_cache, _ = cp(
+                code_input, cache=code_cache, generation_step=code_idx,
+            )
+            next_code = self._sample_token(
+                code_logits, temperature=temperature, top_k=top_k, top_p=top_p,
+            )
+            code_tokens.append(next_code)
+        else:
+            # Parallel: single transformer forward, multiple lm_heads
+            first_idx = group[0]
+            # Input: embedding of the last token from previous group
+            group_input = cp.codec_embedding[first_idx - 1](code_tokens[-1])
+            # Project if needed (when talker and code predictor have different hidden sizes)
+            if cp.small_to_mtp_projection is not None:
+                group_input = cp.small_to_mtp_projection(group_input)
+            # Single forward through 5-layer transformer (updates KV cache once)
+            group_hidden = cp.model(group_input, cache=code_cache)
+            # Apply each lm_head in the group to the shared hidden state
+            for code_idx in group:
+                logits = cp.lm_head[code_idx](group_hidden)
+                next_code = self._sample_token(
+                    logits, temperature=temperature, top_k=top_k, top_p=top_p,
+                )
+                code_tokens.append(next_code)
+
+    return code_tokens
+
+
+def _run_codepred_sequential(self, next_token, hidden, config, temperature, top_k, top_p,
+                             repetition_penalty=None, generated_token_history=None,
+                             suppress_tokens=None, eos_token_id=None):
+    """Run code predictor sequentially (original behavior)."""
+    code_tokens = [next_token]
+    code_hidden = hidden[:, -1:, :]
+    code_cache = self.talker.code_predictor.make_cache()
+
+    for code_idx in range(config.num_code_groups - 1):
+        if code_idx == 0:
+            code_0_embed = self.talker.get_input_embeddings()(next_token)
+            code_input = mx.concatenate([code_hidden, code_0_embed], axis=1)
+        else:
+            code_embed = self.talker.code_predictor.codec_embedding[
+                code_idx - 1
+            ](code_tokens[-1])
+            code_input = code_embed
+
+        code_logits, code_cache, _ = self.talker.code_predictor(
+            code_input, cache=code_cache, generation_step=code_idx,
+        )
+
+        next_code = self._sample_token(
+            code_logits, temperature=temperature, top_k=top_k, top_p=top_p,
+        )
+        code_tokens.append(next_code)
+
+    return code_tokens
+
+
 def _optimized_generate_with_instruct(
     self, text, speaker, language, instruct, temperature, max_tokens,
     top_k, top_p, repetition_penalty, verbose, stream=False, streaming_interval=2.0,
@@ -68,6 +172,15 @@ def _optimized_generate_with_instruct(
     decoded_tokens = 0
     context_size = 25
 
+    # Grouped codebook prediction
+    grouped_scheme = _get_grouped_codepred_scheme()
+    if grouped_scheme:
+        scheme_name = os.environ.get("GROUPED_CODEPRED", "").lower()
+        serial = sum(1 for g in grouped_scheme if len(g) == 1)
+        parallel = len(grouped_scheme) - serial
+        print(f"[GROUPED] scheme={scheme_name}: {serial} serial + {parallel} parallel groups "
+              f"→ {len(grouped_scheme)} forward passes (vs 15 original)")
+
     pbar = tqdm(
         total=effective_max_tokens, desc="Generating", unit="tokens",
         disable=not verbose, leave=False,
@@ -100,28 +213,15 @@ def _optimized_generate_with_instruct(
             t_sample = time.perf_counter()
 
         # Code predictor for remaining 15 codebooks
-        code_tokens = [next_token]
-        code_hidden = hidden[:, -1:, :]
-        code_cache = self.talker.code_predictor.make_cache()
-
-        for code_idx in range(config.num_code_groups - 1):
-            if code_idx == 0:
-                code_0_embed = self.talker.get_input_embeddings()(next_token)
-                code_input = mx.concatenate([code_hidden, code_0_embed], axis=1)
-            else:
-                code_embed = self.talker.code_predictor.codec_embedding[
-                    code_idx - 1
-                ](code_tokens[-1])
-                code_input = code_embed
-
-            code_logits, code_cache, _ = self.talker.code_predictor(
-                code_input, cache=code_cache, generation_step=code_idx,
+        if grouped_scheme:
+            code_tokens = _run_codepred_grouped(
+                self, grouped_scheme, next_token, hidden, config,
+                temperature, top_k, top_p,
             )
-
-            next_code = self._sample_token(
-                code_logits, temperature=temperature, top_k=top_k, top_p=top_p,
+        else:
+            code_tokens = _run_codepred_sequential(
+                self, next_token, hidden, config, temperature, top_k, top_p,
             )
-            code_tokens.append(next_code)
 
         all_codes = mx.concatenate(code_tokens, axis=1)
 
@@ -163,7 +263,7 @@ def _optimized_generate_with_instruct(
 
         generated_token_history.append(token_val)
         generated_codes.append(all_codes)
-        del code_cache
+        # code_cache is now managed inside _run_codepred_* helpers
 
         # Periodic memory cleanup only
         if step > 0 and step % 100 == 0:
@@ -303,6 +403,8 @@ def _optimized_generate_icl(
         disable=not verbose, leave=False,
     )
 
+    grouped_scheme = _get_grouped_codepred_scheme()
+
     for step in range(effective_max_tokens):
         logits, hidden = self.talker(input_embeds, cache=cache)
 
@@ -313,28 +415,15 @@ def _optimized_generate_icl(
             suppress_tokens=suppress_tokens, eos_token_id=eos_token_id,
         )
 
-        code_tokens = [next_token]
-        code_hidden = hidden[:, -1:, :]
-        code_cache = self.talker.code_predictor.make_cache()
-
-        for code_idx in range(config.num_code_groups - 1):
-            if code_idx == 0:
-                code_0_embed = self.talker.get_input_embeddings()(next_token)
-                code_input = mx.concatenate([code_hidden, code_0_embed], axis=1)
-            else:
-                code_embed = self.talker.code_predictor.codec_embedding[
-                    code_idx - 1
-                ](code_tokens[-1])
-                code_input = code_embed
-
-            code_logits, code_cache, _ = self.talker.code_predictor(
-                code_input, cache=code_cache, generation_step=code_idx,
+        if grouped_scheme:
+            code_tokens = _run_codepred_grouped(
+                self, grouped_scheme, next_token, hidden, config,
+                temperature, top_k, top_p,
             )
-
-            next_code = self._sample_token(
-                code_logits, temperature=temperature, top_k=top_k, top_p=top_p,
+        else:
+            code_tokens = _run_codepred_sequential(
+                self, next_token, hidden, config, temperature, top_k, top_p,
             )
-            code_tokens.append(next_code)
 
         all_codes = mx.concatenate(code_tokens, axis=1)
 
@@ -360,7 +449,7 @@ def _optimized_generate_icl(
 
         generated_token_history.append(token_val)
         generated_codes.append(all_codes)
-        del code_cache
+        # code_cache is now managed inside _run_codepred_* helpers
 
         if step > 0 and step % 100 == 0:
             mx.clear_cache()
