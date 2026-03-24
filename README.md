@@ -120,6 +120,42 @@ Select:
 
 ---
 
+## Performance
+
+Inference optimizations applied via monkey-patching in `main.py` (no `.venv` modifications).
+
+**Benchmarks** (MacBook Pro M4 Max 128GB, 1.7B 8-bit model):
+
+| Optimization | Steady-state tok/s | RTF | Method |
+|---|---|---|---|
+| Baseline | ~25 | 2.0x | — |
+| + Fused Metal kernels | ~50 | 4.0x | `mx.fast.rms_norm` + `mx.fast.rope` |
+| + Grouped codebook (alpha, default) | ~90 | 4-5x | 3 serial + 4 parallel groups |
+| + Grouped codebook (beta) | ~100 | 5-6x | 3 serial + 2 parallel groups |
+
+*RTF = audio duration / processing time. RTF 5x means 1 second of compute produces 5 seconds of audio. First token has ~200ms warmup; steady-state numbers shown above.*
+
+### How grouped codebook prediction works
+
+Qwen3-TTS encodes audio with 16 RVQ (Residual Vector Quantization) codebooks. The Code Predictor originally predicts 15 codebooks sequentially, each step depending on the previous sample. Grouped prediction parallelizes later codebooks — sharing a single transformer forward pass and applying separate `lm_head` outputs.
+
+The first 3 codebooks must remain serial: they carry the most critical coarse acoustic information (pitch, energy, fundamental timbre), and the c0→c1→c2 conditional dependency cannot be removed. Experiments confirmed that reducing to 2 serial codebooks causes fully corrupt audio. Later codebooks carry diminishing acoustic detail (resonance → high-frequency → subtle texture) and can be parallelized with minimal quality impact.
+
+### Environment variables
+
+| Variable | Values | Description |
+|---|---|---|
+| `GROUPED_CODEPRED` | `alpha` (default), `beta`, `off` | Codebook grouping scheme. Alpha is quality-safe; beta trades slight artifacts for more speed; off reverts to original 15-step sequential. |
+| `TTS_PROFILE` | `1` | Enable per-step profiling (talker/sample/codepred/embed breakdown). |
+| `ABLATION` | `rmsnorm`, `rope`, `baseline` | Revert specific optimizations for A/B testing. |
+
+### Experiments that didn't work
+
+- **Speculative decoding** (Lite 0.6B as draft for Pro 1.7B): 2.7% acceptance rate. Both models share the same Code Predictor architecture, so the draft is only 1.58x faster — not enough for speculative decoding to be viable.
+- **Gamma scheme** (2 serial + 13 parallel codebooks): Audio fully corrupt. Confirms 3 serial codebooks as the quality floor.
+
+---
+
 ## Requirements
 
 - macOS with Apple Silicon (M1/M2/M3/M4)
